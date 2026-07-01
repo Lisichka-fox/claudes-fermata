@@ -110,28 +110,71 @@ anthropic-beta: extended-cache-ttl-2025-04-11
 > 注意: `ttl: "1h"` 的断点必须放在 `ttl: "5m"` (或不指定 TTL)的断点**前面**。
 > 如果你把 1h 的放在 5m 的后面,API 会报错。
 
-### 多断点策略
+### 多断点策略(实战架构)
 
-实际使用中,通常会设置多个缓存断点(Breakpoint, 简称 BP):
+实际使用中,通常会设置多个缓存断点(Breakpoint, 简称 BP)。以下是一个经过生产验证的四断点架构:
 
 ```mermaid
 flowchart TD
-    BP1["BP1: 核心 system prompt<br/>cache_control: ttl=1h"] --> BP2
-    BP2["BP2: 亲定文本 / 人设<br/>cache_control: ttl=1h"] --> BP3
-    BP3["BP3: 工具定义<br/>cache_control: ttl=1h"] --> BP4
-    BP4["BP4: 倒数第二条消息<br/>cache_control: ttl=1h"] --> MSG
-    MSG["最新用户消息<br/>(不缓存, 每次都不同)"]
+    subgraph SYSTEM["system 层 (三个 block)"]
+        BP1["BP1: 核心协议 / 人设<br/>cache_control: ttl=1h<br/>───────────<br/>角色设定、行为规则、输出格式等<br/>几乎不变,命中率最高"]
+        BP2["BP2: 碎片记忆<br/>cache_control: ttl=1h<br/>───────────<br/>从记忆系统提取的常驻知识碎片<br/>偶尔变化,变化时整个 BP2 重写"]
+        BP3["BP3: 滚动摘要<br/>cache_control: ttl=1h<br/>───────────<br/>历史对话的压缩摘要<br/>对话超长时触发更新"]
+    end
+
+    subgraph MESSAGES["messages 层"]
+        HIST["对话历史<br/>(user/assistant 交替)"]
+        BP4["BP4: 倒数第二条消息<br/>(最近的 assistant 回复)<br/>cache_control: ttl=1h"]
+        LAST["最后一条 user 消息<br/>+ 向量召回结果<br/>+ 外部回复(如有)<br/>(不缓存, 每轮都变)"]
+    end
+
+    BP1 --> BP2 --> BP3 --> HIST --> BP4 --> LAST
 
     style BP1 fill:#2d5a2d,color:#fff
     style BP2 fill:#2d5a2d,color:#fff
     style BP3 fill:#2d5a2d,color:#fff
     style BP4 fill:#3a6b3a,color:#fff
-    style MSG fill:#5a2d2d,color:#fff
+    style HIST fill:#1a365d,color:#fff
+    style LAST fill:#5a2d2d,color:#fff
 ```
 
-**为什么倒数第二条消息也要加断点?**
+#### 为什么这样分层?
 
-因为对话每增加一轮, 之前的所有消息都不会变。在倒数第二条消息上加断点, 可以确保之前的整段对话历史都被缓存, 只有最新一条消息需要重新计算。
+**BP1-BP3 在 system 层**: 这三个 block 组成请求的"头部前缀"。只要内容不变,无论对话进行到第几轮,这部分都会被缓存命中。BP1(协议/人设)几乎永远不变,命中率最高;BP2(碎片记忆)偶尔更新;BP3(滚动摘要)在对话很长时才会触发更新。
+
+**BP4 在 messages 层**: 放在倒数第二条消息(最近的 assistant 回复)上。每增加一轮对话,之前的所有消息都不会变,所以 BP4 让整段对话历史都被缓存,只有最新一条消息需要重新计算。
+
+#### 易变内容怎么放?
+
+**关键原则: 每轮都变的内容必须放在缓存前缀之后,否则会破坏缓存命中。**
+
+以下内容**不能**放进 system 层或加 `cache_control`:
+
+| 易变内容 | 放置位置 | 原因 |
+|----------|----------|------|
+| 向量召回结果 | 拼到最后一条 user 消息末尾 | 每轮召回内容不同 |
+| 外部系统回复(如异步消息) | 拼到最后一条 user 消息末尾 | 实时变化 |
+| 当前时间戳 | 拼到最后一条 user 消息末尾 | 每秒都在变 |
+
+```mermaid
+flowchart LR
+    subgraph CACHED["缓存前缀 (稳定不变)"]
+        S1[BP1 协议] --> S2[BP2 记忆] --> S3[BP3 摘要] --> M[对话历史 + BP4]
+    end
+    subgraph VOLATILE["易变区 (不缓存)"]
+        V["最后一条 user 消息<br/>+ [向量召回] 相关记忆片段...<br/>+ [外部回复] xxx 说: ...<br/>+ [时间] 2026-07-01 11:30"]
+    end
+    M --> V
+
+    style S1 fill:#2d5a2d,color:#fff
+    style S2 fill:#2d5a2d,color:#fff
+    style S3 fill:#2d5a2d,color:#fff
+    style M fill:#2d5a2d,color:#fff
+    style V fill:#5a2d2d,color:#fff
+```
+
+> 这样设计后,向量召回、时间戳等每轮都变的内容不会破坏缓存前缀。
+> 前缀越长越稳定,省的钱越多。
 
 ---
 
